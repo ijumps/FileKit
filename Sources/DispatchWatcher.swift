@@ -117,23 +117,23 @@ public class DispatchVnodeWatcher {
     weak var createWatcher: DispatchVnodeWatcher?
 
     /// The callback for vnode events.
-    private let callback: ((DispatchVnodeWatcher) -> Void)?
+    private let _callback: ((DispatchVnodeWatcher) -> Void)?
 
     /// The queue for the watcher.
-    private let queue: dispatch_queue_t?
+    private let _queue: dispatch_queue_t?
 
     /// A file descriptor for the path.
-    private var fileDescriptor: CInt = -1
+    private var _fileDescriptor: CInt = -1
 
     /// A dispatch source to monitor a file descriptor created from the path.
-    private var source: dispatch_source_t?
+    private var _source: dispatch_source_t?
 
     /// Current events
     ///
     /// Call this function from within the event handler block. 
     /// The result of calling this function outside of the event handler callback is undefined.
     public var currentEvent: DispatchVnodeEvents? {
-        if let source = source {
+        if let source = _source {
             return DispatchVnodeEvents(rawValue: dispatch_source_get_data(source))
         }
         if createWatcher != nil {
@@ -159,8 +159,8 @@ public class DispatchVnodeWatcher {
         ) {
         self.path = path.absolute
         self.events = events
-        self.queue = queue
-        self.callback = callback
+        self._queue = queue
+        self._callback = callback
     }
 
     // MARK: - Deinitialization
@@ -177,8 +177,8 @@ public class DispatchVnodeWatcher {
     /// If `callback` is set, call the `callback`. Else if `delegate` is set, call the `delegate`
     ///
     /// - Parameter eventType: The current event to be watched.
-    private func dispatchDelegate(eventType: DispatchVnodeEvents) {
-        if let callback = self.callback {
+    private func _dispatchDelegate(eventType: DispatchVnodeEvents) {
+        if let callback = self._callback {
             callback(self)
         } else if let delegate = self.delegate {
             if eventType.contains(.Delete) {
@@ -236,7 +236,7 @@ public class DispatchVnodeWatcher {
                     createWatcher = watch(.Write) { [weak self] watch in
                         // stop watching when path created
                         if self?.path.isRegular == true || self?.path.isDirectoryFile == true {
-                            self?.dispatchDelegate(.Create)
+                            self?._dispatchDelegate(.Create)
                             //self.delegate?.fsWatcherDidObserveCreate(self)
                             self?.createWatcher = nil
                             self?.startWatching()
@@ -252,35 +252,35 @@ public class DispatchVnodeWatcher {
             // Only watching for regular file and directory
         else if path.isRegular || path.isDirectoryFile {
 
-            if source == nil && fileDescriptor == -1 {
-                fileDescriptor = open(path.safeRawValue, O_EVTONLY)
-                if fileDescriptor == -1 { return false }
+            if _source == nil && _fileDescriptor == -1 {
+                _fileDescriptor = open(path.safeRawValue, O_EVTONLY)
+                if _fileDescriptor == -1 { return false }
                 var _events = events
                 _events.remove(.Create)
-                source = dispatch_source_create(DispatchSourceType.Vnode, UInt(fileDescriptor), _events.rawValue, queue)
+                _source = dispatch_source_create(DispatchSourceType.Vnode, UInt(_fileDescriptor), _events.rawValue, _queue)
 
                 // Recheck if open success and source create success
-                if source != nil && fileDescriptor != -1 {
-                    guard callback != nil || delegate != nil else {
+                if _source != nil && _fileDescriptor != -1 {
+                    guard _callback != nil || delegate != nil else {
                         return false
                     }
 
                     // Define the block to call when a file change is detected.
-                    dispatch_source_set_event_handler(source!) { //[unowned self] () in
-                        guard let source = self.source else { return }
+                    dispatch_source_set_event_handler(_source!) { //[unowned self] () in
+                        guard let source = self._source else { return }
                         let eventType = DispatchVnodeEvents(rawValue: dispatch_source_get_data(source))
-                        self.dispatchDelegate(eventType)
+                        self._dispatchDelegate(eventType)
                     }
 
                     // Define a cancel handler to ensure the path is closed when the source is cancelled.
-                    dispatch_source_set_cancel_handler(source!) { //[unowned self] () in
-                        Darwin.close(self.fileDescriptor)
-                        self.fileDescriptor = -1
-                        self.source = nil
+                    dispatch_source_set_cancel_handler(_source!) { //[unowned self] () in
+                        Darwin.close(self._fileDescriptor)
+                        self._fileDescriptor = -1
+                        self._source = nil
                     }
 
                     // Start monitoring the path via the source.
-                    dispatch_resume(source!)
+                    dispatch_resume(_source!)
                     return true
                 }
             }
@@ -297,8 +297,8 @@ public class DispatchVnodeWatcher {
     ///
     /// Cancellation prevents any further invocation of the event handler block for the specified dispatch source, but does not interrupt an event handler block that is already in progress.
     public func stopWatching() {
-        if source != nil {
-            dispatch_source_cancel(source!)
+        if _source != nil {
+            dispatch_source_cancel(_source!)
         }
     }
 
@@ -306,9 +306,9 @@ public class DispatchVnodeWatcher {
     public func close() {
         createWatcher?.stopWatching()
         stopWatching()
-        Darwin.close(self.fileDescriptor)
-        self.fileDescriptor = -1
-        self.source = nil
+        Darwin.close(self._fileDescriptor)
+        self._fileDescriptor = -1
+        self._source = nil
     }
 
 
