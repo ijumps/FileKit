@@ -129,6 +129,9 @@ public class DispatchVnodeWatcher {
     private var source: dispatch_source_t?
 
     /// Current events
+    ///
+    /// Call this function from within the event handler block. 
+    /// The result of calling this function outside of the event handler callback is undefined.
     public var currentEvent: DispatchVnodeEvents? {
         if let source = source {
             return DispatchVnodeEvents(rawValue: dispatch_source_get_data(source))
@@ -237,7 +240,7 @@ public class DispatchVnodeWatcher {
                             //self.delegate?.fsWatcherDidObserveCreate(self)
                             self?.createWatcher = nil
                             self?.startWatching()
-                            watch.stopWatching()
+                            watch.close()
                         }
                     }
                     return true
@@ -264,7 +267,8 @@ public class DispatchVnodeWatcher {
 
                     // Define the block to call when a file change is detected.
                     dispatch_source_set_event_handler(source!) { //[unowned self] () in
-                        let eventType = DispatchVnodeEvents(rawValue: dispatch_source_get_data(self.source!))
+                        guard let source = self.source else { return }
+                        let eventType = DispatchVnodeEvents(rawValue: dispatch_source_get_data(source))
                         self.dispatchDelegate(eventType)
                     }
 
@@ -290,6 +294,8 @@ public class DispatchVnodeWatcher {
     /// Stop watching.
     ///
     /// **Note:** make sure call this func, or `self` will not release
+    ///
+    /// Cancellation prevents any further invocation of the event handler block for the specified dispatch source, but does not interrupt an event handler block that is already in progress.
     public func stopWatching() {
         if source != nil {
             dispatch_source_cancel(source!)
@@ -299,6 +305,7 @@ public class DispatchVnodeWatcher {
     /// Closes the watcher.
     public func close() {
         createWatcher?.stopWatching()
+        stopWatching()
         Darwin.close(self.fileDescriptor)
         self.fileDescriptor = -1
         self.source = nil

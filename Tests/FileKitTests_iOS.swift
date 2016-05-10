@@ -112,8 +112,8 @@ class FileKitTests: XCTestCase {
     }
     
     func testStandardizingPath() {
-        let a: Path = "~/.."
-        let b: Path = "/Users"
+        let a: Path = "~"
+        let b: Path = .UserHome
         XCTAssertEqual(a.standardized, b.standardized)
     }
     
@@ -150,7 +150,7 @@ class FileKitTests: XCTestCase {
     }
     
     func testPathChildren() {
-        let p: Path = "/Users"
+        let p: Path = .UserHome
         XCTAssertNotEqual(p.children(), [])
     }
     
@@ -183,7 +183,10 @@ class FileKitTests: XCTestCase {
     }
     
     func testFamily() {
-        let p: Path = Path.UserTemporary
+        let p: Path = Path.UserTemporary + "Family"
+        try! p.createDirectory()
+        let pChilds = p + "FamilyParent/aFamilyChild"
+        try! pChilds.createDirectory()
         let children = p.children()
         
         guard let child  = children.first else {
@@ -339,6 +342,7 @@ class FileKitTests: XCTestCase {
         XCTAssertNotEqual(Path.Current, Path.UserTemporary)
     }
     
+    // no volumes on iOS
     func testVolumes() {
         var volumes = Path.volumes()
         XCTAssertFalse(volumes.isEmpty, "No volume")
@@ -458,6 +462,7 @@ class FileKitTests: XCTestCase {
         }
     }
     
+    // not all path exists in iOS
     func testWellKnownDirectories() {
         var paths: [Path] = [
             .UserHome, .UserTemporary, .UserCaches, .UserDesktop, .UserDocuments,
@@ -729,6 +734,7 @@ class FileKitTests: XCTestCase {
     
     func testWatch() {
         let pathToWatch = .UserTemporary + "filekit_test_watch"
+        try? pathToWatch.createFile()
         let expectation = "event"
         let operation = {
             do {
@@ -741,16 +747,216 @@ class FileKitTests: XCTestCase {
         
         // Do watch test
         let expt = self.expectationWithDescription(expectation)
-        let watcher = pathToWatch.watch { event in
-            print("\n\n\(event.currentEvent)\n\n")
+        let watcher = pathToWatch.watch { watch in
+            print("\n\n\(watch.currentEvent)\n\n")
             // XXX here could check expected event type according to operation
             expt.fulfill()
+            watch.close()
         }
         defer {
-            watcher.close()
+            //watcher.close()
         }
+        sleep(1)
         operation()
-        self.waitForExpectationsWithTimeout(10, handler: nil)
+        self.waitForExpectationsWithTimeout(5, handler: nil)
     }
     
+    /// Callbacks call asynchronous on a a system-defined global concurrent queue, the result may out of order
+    ///
+    /// Capture events may be split or merge. a single one like:
+    /// `Optional(DispatchVnodeEvents[Attribute(8)])` and `Optional(DispatchVnodeEvents[Extend(4)])` 
+    /// or a merge one like: `Optional(DispatchVnodeEvents[Extend(4), Attribute(8)])`
+    ///
+    /// This may cause `NSInternalInconsistencyException (API violation)` because two events happen and call `expt.fulfill()` twice.
+    /// Call `watcher.close()` right after `expt.fulfill()` is likely to solve this.
+    ///
+    /// Also, Cancellation with `dispatch_source_cancel` prevents any further invocation of the event handler block for the specified dispatch source, but does not interrupt an event handler block that is already in progress.
+    ///
+    /// There is a latency between init the watch and the kernel readly to process the delegate.
+    /// `dispatch_source_create` create the `source` asynchronous, before the kernel readly to monitor and process the delegate, following operation which affects the file may already happened.
+    ///
+    /// This cause `DispatchVnodeWatcher` may miss some events, like only catch `Optional(DispatchVnodeEvents[Attribute(8)])` while the full event should be `Optional(DispatchVnodeEvents[Extend(4), Attribute(8)])` occasionally, or rarely but exists that no events catch
+    /// A rough way to solve this is call `sleep(1)` before `operation()`.
+    /// Use a higher priority queue like `dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0)` also helps.
+    func testWatchMultiTimes() {
+        let cycle = 1000
+        var catched = 0
+        let pathToWatch = .UserTemporary + "filekit_test_watch"
+        // not test a create event
+        try? pathToWatch.createFile()
+        let operation = {
+            do {
+                let message = "Testing file system event when writing..."
+                try message.writeToPath(pathToWatch, atomically: false)
+            } catch {
+                XCTFail(String(error))
+            }
+        }
+        for i in 1...cycle {
+            // Do watch test
+            let watcher = pathToWatch.watch { watch in
+                print("\n\n\(watch.currentEvent)\n\n", "index: ", i)
+                catched += 1
+                // XXX here could check expected event type according to operation
+                
+                // close in defer is not a better idea, try and see what's the difference
+                // comment this to see behave for multi watchs on the same path
+                watch.close()
+            }
+            defer {
+                //watcher.close()
+            }
+            // sleep here most likely solve missing event on a simulator
+            //usleep(100000)
+            operation()
+        }
+        // wait asynchronous callbacks end
+        sleep(1)
+        // Always succes on a real ios device(1000/1000) while most likely fail on a simulator(996/1000)
+        // I guest api differ in the simulator and the real device
+        XCTAssertEqual(cycle, catched, "should catch \(cycle) times, only \(catched) catched")
+    }
+    
+    func testWatchWithCreate() {
+        let pathToWatch = .UserTemporary + "filekit_test_watch"
+        try? pathToWatch.deleteFile()
+        let expectation = "event"
+        let operation = {
+            do {
+                let message = "Testing file system event when writing..."
+                try message.writeToPath(pathToWatch, atomically: false)
+                usleep(10000)
+                try message.writeToPath(pathToWatch, atomically: false)
+            } catch {
+                XCTFail(String(error))
+            }
+        }
+        
+        // Do watch test
+        let expt = self.expectationWithDescription(expectation)
+        let watcher = pathToWatch.watch { watch in
+            print("\n\n\(watch.currentEvent)\n\n")
+            // XXX here could check expected event type according to operation
+            if watch.currentEvent != .Create {
+                expt.fulfill()
+                watch.close()
+            }
+        }
+        defer {
+            //watcher.close()
+        }
+        sleep(1)
+        operation()
+        self.waitForExpectationsWithTimeout(5, handler: nil)
+    }
+    
+    // There is a latency between create event call(on parent write event) and watcher set for path.
+    // May miss some events after create.
+    func testWatchMultiTimesWithCreate() {
+        let cycle = 1000
+        var catchedEvent = 0
+        var catchedCreate = 0
+        let pathToWatch = .UserTemporary + "filekit_test_watch"
+        //test a create event
+        try? pathToWatch.deleteFile()
+        usleep(10000)
+        let operation = {
+            do {
+                let message = "Testing file system event when writing..."
+                try message.writeToPath(pathToWatch, atomically: false)
+                usleep(10000)
+                try message.writeToPath(pathToWatch, atomically: false)
+            } catch {
+                XCTFail(String(error))
+            }
+        }
+        for i in 1...cycle {
+            // Do watch test
+            let watcher = pathToWatch.watch(/*queue: dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0)*/) { watch in
+                print("\n\n\(watch.currentEvent)\n\n", "index: ", i)
+                catchedEvent += 1
+                // XXX here could check expected event type according to operation
+                
+                if watch.currentEvent?.contains(.Create) == false {
+                    watch.close()
+                } else if watch.currentEvent?.contains(.Create) == true {
+                    catchedCreate += 1
+                }
+            }
+            defer {
+                //watcher.close()
+            }
+            // start the queue on a device is slow
+            if i == 1 { sleep(1) }
+            usleep(1000)
+            operation()
+            usleep(1000)
+            try? pathToWatch.deleteFile()
+        }
+        // wait asynchronous callbacks end
+        sleep(1)
+        // Always succes on a real ios device(1000/1000) while most likely fail on a simulator(996/1000)
+        // I guest api differ in the simulator and the real device
+        XCTAssertEqual(cycle * 2, catchedEvent, "should catch events \(cycle * 2) times, only \(catchedEvent) catched")
+        XCTAssertEqual(cycle, catchedCreate, "should catch create events \(cycle) times, only \(catchedCreate) catched")
+    }
+    
+    class WatchDelegate: DispatchVnodeWatcherDelegate {
+        
+        weak var expt: XCTestExpectation?
+        
+        init(expt: XCTestExpectation?) {
+            self.expt = expt
+        }
+        
+        func fsWatcherDidObserveDirectoryChange(watch: DispatchVnodeWatcher) {
+            print("\n\nDirectory: \(watch.path) changed \n\n", watch.currentEvent)
+        }
+        
+        func fsWatcherDidObserveCreate(watch: DispatchVnodeWatcher) {
+            print("\n\nPath :\(watch.path) created \n\n", watch.currentEvent)
+        }
+        
+        func fsWatcherDidObserveDelete(watch: DispatchVnodeWatcher) {
+            print("\n\nPath :\(watch.path) deleted \n\n", watch.currentEvent)
+            expt?.fulfill()
+        }
+        
+        func fsWatcherDidObserveAttrib(watch: DispatchVnodeWatcher) {
+            print("\n\nPath :\(watch.path) attributed \n\n", watch.currentEvent)
+        }
+        
+        func fsWatcherDidObserveWrite(watch: DispatchVnodeWatcher) {
+            print("\n\nPath: \(watch.path) writed \n\n", watch.currentEvent)
+        }
+    }
+    
+    func testWatchDelegate() {
+        let pathToWatch = .UserTemporary + "filekit_test_watch_file"
+        try? pathToWatch.deleteFile()
+        let expectation = "event"
+        let operation = {
+            do {
+                try? pathToWatch.createDirectory()
+                sleep(1)
+                try? pathToWatch.touch()
+                let message = "Testing file system event when writing..."
+                try message.writeToPath(pathToWatch + "file", atomically: false)
+                sleep(1)
+                try? pathToWatch.deleteFile()
+            } catch {
+                XCTFail(String(error))
+            }
+        }
+        // Do watch test
+        weak var expt = self.expectationWithDescription(expectation)
+        let delegate = WatchDelegate(expt: expt)
+        var watcher: DispatchVnodeWatcher? = pathToWatch.watch(delegate: delegate)
+        sleep(1)
+        operation()
+        sleep(1)
+        watcher?.close()
+        watcher = nil
+        self.waitForExpectationsWithTimeout(10, handler: nil)
+    }
 }
